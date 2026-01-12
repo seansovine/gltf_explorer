@@ -1,3 +1,8 @@
 #!/usr/bin/env bash
 
-cargo run --release --quiet -- -t > scratch/testout.txt
+set -e
+
+OUTFILE="scratch/testout.txt"
+
+cargo run --release --quiet -- -t > "$OUTFILE"
+printf "Data written to $OUTFILE.\n"
