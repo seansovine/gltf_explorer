@@ -5,8 +5,30 @@ use std::cell::RefCell;
 
 use gltf::{Document, Mesh, Node, buffer::Data, mesh::Mode, scene::Transform};
 
+const DEFAULT_COLOR: [f32; 3] = [1.0, 0.0, 0.0];
+
+pub struct GpuVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub normal: [f32; 3],
+    pub tex_coords: [f32; 2],
+}
+
+impl Default for GpuVertex {
+    fn default() -> Self {
+        Self {
+            position: [0.0, 0.0, 0.0],
+            color: [1.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 0.0],
+            tex_coords: [0.0, 0.0],
+        }
+    }
+}
+
 #[derive(Default)]
-pub struct RenderMesh {}
+pub struct RenderMesh {
+    pub vertices: Vec<GpuVertex>,
+}
 
 #[derive(Default)]
 pub struct RenderScene {
@@ -16,6 +38,8 @@ pub struct RenderScene {
 pub struct GltfLoader {
     pub document: Document,
     pub buffer_data: Vec<Data>,
+
+    // Could avoid RefCell, but it simplifies function signatures for now.
     pub render_scene: RefCell<RenderScene>,
 }
 
@@ -33,6 +57,7 @@ impl GltfLoader {
 impl GltfLoader {
     pub fn traverse(&self) {
         for scene in self.document.scenes() {
+            // Traverse root nodes of scene.
             for node in scene.nodes() {
                 self.log_node(&node, 1);
                 self.traverse_children(&node, 2);
@@ -88,6 +113,9 @@ impl GltfLoader {
                     println!("Rotation: {rotation:?}");
                     Self::indent(depth + 2);
                     println!("Scale: {scale:?}");
+                    panic!(
+                        "UNIMPLEMENTED: Reader expects no non-trivial decomposed transformations."
+                    );
                 }
             }
         }
@@ -99,7 +127,8 @@ impl GltfLoader {
         println!("Node has mesh.");
 
         let mut render_scene = self.render_scene.borrow_mut();
-        render_scene.meshes.push(RenderMesh {});
+        render_scene.meshes.push(RenderMesh::default());
+        let render_mesh = render_scene.meshes.last_mut().unwrap();
 
         for primitive in mesh.primitives() {
             if primitive.mode() != Mode::Triangles {
@@ -107,9 +136,19 @@ impl GltfLoader {
             }
 
             let reader = primitive.reader(|buff_idx| Some(&self.buffer_data[buff_idx.index()]));
-            let _position_reader = reader.read_positions().unwrap();
+            let iter = reader
+                .read_positions()
+                .unwrap()
+                .zip(reader.read_normals().unwrap());
 
-            // TODO: Read data into the structure.
+            for (position, normal) in iter {
+                render_mesh.vertices.push(GpuVertex {
+                    position,
+                    color: DEFAULT_COLOR,
+                    normal,
+                    ..Default::default()
+                });
+            }
         }
     }
 }
