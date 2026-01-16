@@ -23,7 +23,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let file_data = std::fs::read(TEST_FILE_PATH)?;
         let gltf = Gltf::from_slice(&file_data)?;
         gltf_explorer::convert(&gltf)?;
+        return Ok(());
     }
+
     if app_args.get_flag("traverse") {
         if READ_LOW_LEVEL {
             let file_data = std::fs::read(TEST_FILE_PATH)?;
@@ -34,7 +36,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let loader = high_level::GltfLoader::create(TEST_FILE_PATH);
             loader.traverse();
         }
+        return Ok(());
     }
 
+    println!("No command was supplied. See --help.");
     Ok(())
 }

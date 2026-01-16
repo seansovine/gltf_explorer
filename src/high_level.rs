@@ -3,36 +3,16 @@
 
 use std::cell::RefCell;
 
-use gltf::{Document, Mesh, Node, buffer::Data, mesh::Mode, scene::Transform};
+use gltf::{Document, Mesh, Node, buffer::Data, image::Source, mesh::Mode, scene::Transform};
 
-const DEFAULT_COLOR: [f32; 3] = [1.0, 0.0, 0.0];
+use crate::render_data::{self, GpuVertex, MatrixUniform, RenderMesh, RenderScene};
 
-pub struct GpuVertex {
-    pub position: [f32; 3],
-    pub color: [f32; 3],
-    pub normal: [f32; 3],
-    pub tex_coords: [f32; 2],
-}
-
-impl Default for GpuVertex {
-    fn default() -> Self {
-        Self {
-            position: [0.0, 0.0, 0.0],
-            color: [1.0, 0.0, 1.0],
-            normal: [0.0, 0.0, 0.0],
-            tex_coords: [0.0, 0.0],
-        }
+fn node_matrix(node: &Node) -> MatrixUniform {
+    match node.transform() {
+        Transform::Matrix { matrix } => matrix.into(),
+        // For our current models decomposed form is always identity.
+        Transform::Decomposed { .. } => MatrixUniform::identity(),
     }
-}
-
-#[derive(Default)]
-pub struct RenderMesh {
-    pub vertices: Vec<GpuVertex>,
-}
-
-#[derive(Default)]
-pub struct RenderScene {
-    pub meshes: Vec<RenderMesh>,
 }
 
 pub struct GltfLoader {
@@ -56,11 +36,13 @@ impl GltfLoader {
 
 impl GltfLoader {
     pub fn traverse(&self) {
+        let root_matrix = MatrixUniform::identity();
         for scene in self.document.scenes() {
             // Traverse root nodes of scene.
             for node in scene.nodes() {
-                self.log_node(&node, 1);
-                self.traverse_children(&node, 2);
+                let matrix = node_matrix(&node) * root_matrix;
+                self.add_node(&node, 1, &matrix);
+                self.traverse_children(&node, 2, &matrix);
             }
         }
         println!(
@@ -69,10 +51,11 @@ impl GltfLoader {
         );
     }
 
-    fn traverse_children(&self, node: &Node, depth: usize) {
+    fn traverse_children(&self, node: &Node, depth: usize, parent_matrix: &MatrixUniform) {
         for child in node.children() {
-            self.log_node(&child, depth);
-            self.traverse_children(&child, depth + 1);
+            let matrix = node_matrix(node) * *parent_matrix;
+            self.add_node(&child, depth, &matrix);
+            self.traverse_children(&child, depth + 1, &matrix);
         }
     }
 
@@ -81,18 +64,23 @@ impl GltfLoader {
         print!("{}", " ".repeat(depth * INDENT));
     }
 
-    fn log_node(&self, node: &Node, depth: usize) {
+    fn add_node(&self, node: &Node, depth: usize, matrix: &MatrixUniform) {
+        // Some logging.
+        Self::log_node(node, depth);
+        if let Some(mesh) = node.mesh() {
+            self.add_mesh(&mesh, depth + 1, matrix);
+        }
+    }
+
+    fn log_node(node: &Node, depth: usize) {
         Self::indent(depth);
         println!(
             "Node {}: {}",
             node.index(),
             node.name().unwrap_or("<UNNAMED>")
         );
-        if let Some(mesh) = node.mesh() {
-            self.log_mesh(&mesh, depth + 1);
-        }
         match node.transform() {
-            Transform::Matrix { .. } => {
+            Transform::Matrix { matrix: _ } => {
                 Self::indent(depth + 1);
                 println!("Node has matrix.");
             }
@@ -103,9 +91,11 @@ impl GltfLoader {
             } => {
                 Self::indent(depth + 1);
                 println!("Node has decomposed transformation.");
+
                 let nontrivial = translation != [0.0_f32, 0.0_f32, 0.0_f32]
                     || rotation != [0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32]
                     || scale != [1.0_f32, 1.0_f32, 1.0_f32];
+
                 if nontrivial {
                     Self::indent(depth + 2);
                     println!("Nontrivial translation: {translation:?}");
@@ -113,6 +103,7 @@ impl GltfLoader {
                     println!("Rotation: {rotation:?}");
                     Self::indent(depth + 2);
                     println!("Scale: {scale:?}");
+
                     panic!(
                         "UNIMPLEMENTED: Reader expects no non-trivial decomposed transformations."
                     );
@@ -122,33 +113,65 @@ impl GltfLoader {
         println!();
     }
 
-    fn log_mesh(&self, mesh: &Mesh, depth: usize) {
+    fn add_mesh(&self, mesh: &Mesh, depth: usize, matrix: &MatrixUniform) {
         Self::indent(depth);
         println!("Node has mesh.");
 
         let mut render_scene = self.render_scene.borrow_mut();
-        render_scene.meshes.push(RenderMesh::default());
+        render_scene.meshes.push(RenderMesh {
+            matrix: *matrix,
+            ..Default::default()
+        });
         let render_mesh = render_scene.meshes.last_mut().unwrap();
 
         for primitive in mesh.primitives() {
             if primitive.mode() != Mode::Triangles {
                 continue;
             }
-
             let reader = primitive.reader(|buff_idx| Some(&self.buffer_data[buff_idx.index()]));
+
+            // Add position and normal coordinates.
             let iter = reader
                 .read_positions()
                 .unwrap()
                 .zip(reader.read_normals().unwrap());
-
             for (position, normal) in iter {
                 render_mesh.vertices.push(GpuVertex {
                     position,
-                    color: DEFAULT_COLOR,
+                    color: render_data::DEFAULT_COLOR,
                     normal,
                     ..Default::default()
                 });
             }
+
+            // Add indices.
+            render_mesh.indices = reader.read_indices().unwrap().into_u32().collect();
+
+            // Assume first set of coords is for base color texture.
+            if let Some(iter) = reader.read_tex_coords(0) {
+                render_mesh
+                    .vertices
+                    .iter_mut()
+                    .zip(iter.into_f32())
+                    .for_each(|(vertex, tex_coords)| vertex.tex_coords = tex_coords);
+            }
+
+            let pbr_metallic = primitive.material().pbr_metallic_roughness();
+
+            if let Some(info) = pbr_metallic.base_color_texture() {
+                let image_source = info.texture().source().source();
+                match image_source {
+                    Source::Uri { uri, .. } => {
+                        Self::indent(depth + 1);
+                        println!("Mesh has texture: {uri}");
+                    }
+                    Source::View { .. } => {
+                        Self::indent(depth + 1);
+                        println!("Mesh has buffer view texture.");
+                    }
+                }
+            }
         }
+        println!();
     }
 }
